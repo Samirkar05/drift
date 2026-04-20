@@ -164,6 +164,7 @@ def train_drift(args, rigid_movement= False):
     train_dataset = args.train_dataset
     ckpdir = os.path.join(args.save, train_dataset)
     if rigid_movement is not False:
+        print("Training with rigid movement (no drift).")
         trained_head_path = os.path.join(ckpdir, 'trained_rigid_drift_head.pt')
     else:
         trained_head_path = os.path.join(ckpdir, 'trained_drift_head.pt')
@@ -331,7 +332,6 @@ def train_drift(args, rigid_movement= False):
         print(f"Best validation accuracy: {100.0 * best_val_acc:.2f}%")
         print(f"Training loss at best epoch: {best_train_loss:.6f}")
         print(f"Validation loss at best epoch: {best_val_loss:.6f}")
-        print(f"Drift vector is: {model.module.classification_head.drift}")
 
     if args.save is not None:
         return trained_head_path

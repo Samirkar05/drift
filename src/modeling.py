@@ -64,7 +64,7 @@ class DriftClassificationHead(nn.Linear):
         else:
             self.bias = nn.Parameter(torch.zeros(output_size), requires_grad=False)
 
-        self.drift = nn.Parameter(torch.zeros(input_size))  # [D]
+        self.drift = nn.Parameter(torch.zeros(input_size), requires_grad=True)
 
     def forward(self, inputs):
         if self.normalize:

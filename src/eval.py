@@ -89,37 +89,18 @@ def custom_eval_single_dataset(trained_drift_head, image_encoder, dataset_name, 
     
     return metrics
 
-def _resolve_drift_head(drift_head_source, dataset_name, cache=None):
-    """Resolve a drift head from supported source formats."""
-    if cache is None:
-        cache = {}
-
-    if isinstance(drift_head_source, str):
-        if drift_head_source not in cache:
-            cache[drift_head_source] = torch.load(drift_head_source)
-        return cache[drift_head_source]
-
-    if isinstance(drift_head_source, dict):
-        if dataset_name in drift_head_source:
-            return _resolve_drift_head(drift_head_source[dataset_name], dataset_name, cache=cache)
-        if "drift" in drift_head_source:
-            return _resolve_drift_head(drift_head_source["drift"], dataset_name, cache=cache)
-        raise KeyError(
-            f"Could not resolve drift head for dataset '{dataset_name}'. "
-            f"Available keys: {list(drift_head_source.keys())}"
-        )
-
-    return drift_head_source
-
-def custom_evaluate(trained_drift_heads, image_encoder, args):
+def custom_evaluate(trained_drift_head_source, image_encoder, args):
     if args.eval_datasets is None:
         return
     info = vars(args)
-    cache = {}
+    if isinstance(trained_drift_head_source, str):
+        trained_drift_head = torch.load(trained_drift_head_source)
+    else:
+        trained_drift_head = trained_drift_head_source
+
     for i, dataset_name in enumerate(args.eval_datasets):
         print('Evaluating on', dataset_name)
 
-        trained_drift_head = _resolve_drift_head(trained_drift_heads, dataset_name, cache=cache)
         results = custom_eval_single_dataset(trained_drift_head, image_encoder, dataset_name, args)
 
         if 'top1' in results:
