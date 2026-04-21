@@ -21,9 +21,46 @@ def parse_drift_eval_args():
         default="drift",
         help="Which trained head to evaluate: drift -> trained_drift_head.pt, rigid -> trained_rigid_drift_head.pt.",
     )
+    parser.add_argument(
+        "--delete-results",
+        action="store_true",
+        help="Delete existing result files for this run tag before evaluation.",
+    )
+    parser.add_argument(
+        "--delete-dataset",
+        choices=datasets,
+        default=None,
+        help="Delete results for one dataset only (requires --delete-results).",
+    )
+    parser.add_argument(
+        "--delete-only",
+        action="store_true",
+        help="Delete results and exit without running evaluation.",
+    )
     drift_eval_args, remaining = parser.parse_known_args()
     sys.argv = [sys.argv[0]] + remaining
     return drift_eval_args
+
+
+def _result_file_path(results_dir, run_tag, dataset):
+    return os.path.join(results_dir, f"results_{run_tag}_{dataset}")
+
+
+def delete_results(results_dir, run_tag, target_dataset=None):
+    datasets_to_delete = [target_dataset] if target_dataset is not None else datasets
+    deleted = 0
+
+    for dataset in datasets_to_delete:
+        result_file = _result_file_path(results_dir, run_tag, dataset)
+        if os.path.isfile(result_file):
+            os.remove(result_file)
+            deleted += 1
+            print(f'Deleted result file: "{result_file}"')
+        else:
+            print(f'No result file to delete for {dataset}: "{result_file}"')
+
+    print(f"Deleted {deleted} result file(s).")
+    return deleted
 
 
 drift_eval_args = parse_drift_eval_args()
@@ -42,6 +79,12 @@ for model in models:
         source = os.path.join(BASE_DIR, f"{model}/{dataset}Val")
         checkpoints[model][dataset] = os.path.join(source, head_filename)
 
+if drift_eval_args.delete_results:
+    delete_results(RESULTS_DIR, run_tag, target_dataset=drift_eval_args.delete_dataset)
+    if drift_eval_args.delete_only:
+        print("Deletion requested with --delete-only; exiting.")
+        sys.exit(0)
+
 # Calculating finetuned models on all datasets
 for model in models:
     for checkpoint_path in checkpoints[model].items():
@@ -52,7 +95,7 @@ for model in models:
         args.model = model
         args.save = f'/data/139-1/users/selkarrat/checkpoints/{model}'
         head_path = checkpoint_path[1]
-        DIR = os.path.join(RESULTS_DIR, f"results_{run_tag}_{checkpoint_path[0]}")
+        DIR = _result_file_path(RESULTS_DIR, run_tag, checkpoint_path[0])
         if os.path.isfile(DIR):
             print(f'\nResults already existing: \"results_{run_tag}_{checkpoint_path[0]}\".')
             print("Skipping evaluation...")

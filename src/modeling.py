@@ -49,6 +49,55 @@ class ImageEncoder(torch.nn.Module):
         self.model.load_from_state_dict(state_dict)
         
 
+class TaskAdapter(nn.Module):
+    def __init__(self, dim, normalize_output=True):
+        super().__init__()
+        self.normalize_output = normalize_output
+        self.proj = nn.Linear(dim, dim, bias=False)
+        nn.init.eye_(self.proj.weight)
+
+    def forward(self, class_embeds):
+        adapted = self.proj(class_embeds)
+        if self.normalize_output:
+            adapted = F.normalize(adapted, dim=-1)
+        return adapted
+
+    def save(self, filename):
+        print(f'Saving adapter to {filename}')
+        utils.torch_save(self, filename)
+
+    @classmethod
+    def load(cls, filename):
+        print(f'Loading adapter from {filename}')
+        return utils.torch_load(filename)
+
+
+class AdapterImageClassifier(torch.nn.Module):
+    def __init__(self, image_encoder, adapter, classification_head):
+        super().__init__()
+        self.image_encoder = image_encoder
+        self.adapter = adapter
+        self.classification_head = classification_head
+        if self.image_encoder is not None:
+            self.train_preprocess = self.image_encoder.train_preprocess
+            self.val_preprocess = self.image_encoder.val_preprocess
+
+    def freeze_base(self):
+        for param in self.image_encoder.parameters():
+            param.requires_grad_(False)
+        self.classification_head.weight.requires_grad_(False)
+        self.classification_head.bias.requires_grad_(False)
+
+    def forward(self, inputs):
+        features = self.image_encoder(inputs)
+        if self.classification_head.normalize:
+            features = features / features.norm(dim=-1, keepdim=True)
+
+        adapted_text_embeds = self.adapter(self.classification_head.weight)
+        return F.linear(features, adapted_text_embeds, self.classification_head.bias)
+
+    def __call__(self, inputs):
+        return self.forward(inputs)
 
 class DriftClassificationHead(nn.Linear):
     def __init__(self, normalize, weights, biases=None):
@@ -64,7 +113,7 @@ class DriftClassificationHead(nn.Linear):
         else:
             self.bias = nn.Parameter(torch.zeros(output_size), requires_grad=False)
 
-        self.drift = nn.Parameter(torch.zeros(input_size), requires_grad=True)
+        self.drift = nn.Parameter(torch.zeros(input_size), requires_grad=True) # [D]
 
     def forward(self, inputs):
         if self.normalize:

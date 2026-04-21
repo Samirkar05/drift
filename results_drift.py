@@ -46,12 +46,15 @@ def _resolve_results_root(user_path: Optional[str]) -> Path:
     return Path("/data/139-1/users/selkarrat/results")
 
 
-def _collect_rows(model_dir: Path) -> List[Tuple[str, float, float, float]]:
+def _collect_rows(
+    model_dir: Path, run_tag: str
+) -> List[Tuple[str, float, float, float]]:
     drift_dir = model_dir / "drift_eval"
     rows = []
 
-    for drift_file in sorted(drift_dir.glob("results_drift_*")):
-        dataset = drift_file.name.replace("results_drift_", "", 1)
+    prefix = f"results_{run_tag}_"
+    for drift_file in sorted(drift_dir.glob(f"{prefix}*")):
+        dataset = drift_file.name.replace(prefix, "", 1)
         zeroshot_file = model_dir / f"results_zeroshot_{dataset}"
 
         drift_top1 = _extract_top1(drift_file, dataset)
@@ -66,14 +69,14 @@ def _collect_rows(model_dir: Path) -> List[Tuple[str, float, float, float]]:
     return rows
 
 
-def _print_table(rows: List[Tuple[str, float, float, float]]) -> None:
+def _print_table(rows: List[Tuple[str, float, float, float]], head_label: str) -> None:
     if not rows:
         print("No comparable drift/zeroshot results found.")
         return
 
     rows = sorted(rows, key=lambda x: x[0])
 
-    header = f"{'Dataset':<12} {'Zeroshot':>10} {'Drift':>10} {'Delta':>10}"
+    header = f"{'Dataset':<12} {'Zeroshot':>10} {head_label:>10} {'Delta':>10}"
     print(header)
     print("-" * len(header))
 
@@ -87,11 +90,14 @@ def _print_table(rows: List[Tuple[str, float, float, float]]) -> None:
     print(f"{'AVG':<12} {avg_zero:>10.4f} {avg_drift:>10.4f} {avg_delta:>+10.4f}")
 
 
-def _write_csv(rows: List[Tuple[str, float, float, float]], output: Path) -> None:
+def _write_csv(
+    rows: List[Tuple[str, float, float, float]], output: Path, head_type: str
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    head_col = f"{head_type}_top1"
     with output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["dataset", "zeroshot_top1", "drift_top1", "delta"])
+        writer.writerow(["dataset", "zeroshot_top1", head_col, "delta"])
         for dataset, zeroshot, drift, delta in sorted(rows, key=lambda x: x[0]):
             writer.writerow([dataset, zeroshot, drift, delta])
     print(f"\nSaved comparison CSV to: {output}")
@@ -102,6 +108,12 @@ def main() -> None:
         description="Compare drift vs zeroshot top1 results for a model."
     )
     parser.add_argument("--model", default="ViT-B-32", help="Model name.")
+    parser.add_argument(
+        "--head-type",
+        choices=["drift", "rigid"],
+        default="drift",
+        help="Which evaluated head to compare against zeroshot.",
+    )
     parser.add_argument(
         "--results-root",
         default=None,
@@ -120,11 +132,13 @@ def main() -> None:
     if not model_dir.is_dir():
         raise FileNotFoundError(f"Model results folder not found: {model_dir}")
 
-    rows = _collect_rows(model_dir)
-    _print_table(rows)
+    run_tag = "rigid_drift" if args.head_type == "rigid" else "drift"
+    rows = _collect_rows(model_dir, run_tag)
+    head_label = "Rigid" if args.head_type == "rigid" else "Drift"
+    _print_table(rows, head_label)
 
     if args.csv:
-        _write_csv(rows, Path(args.csv).expanduser())
+        _write_csv(rows, Path(args.csv).expanduser(), args.head_type)
 
 
 if __name__ == "__main__":

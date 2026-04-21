@@ -7,7 +7,7 @@ from src.args import parse_arguments
 from src.datasets.common import get_dataloader, maybe_dictionarize
 from src.datasets.registry import get_dataset
 from src.eval import evaluate
-from src.modeling import ImageEncoder, ImageClassifier, MultiHeadImageClassifier
+from src.modeling import ImageEncoder, ImageClassifier, MultiHeadImageClassifier, AdapterImageClassifier, TaskAdapter
 from src.utils import cosine_lr, LabelSmoothing
 from src.heads import get_classification_head
 
@@ -16,17 +16,8 @@ import src.datasets as datasets
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src import utils
 
-class TaskDriftAdapter(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.drift = nn.Parameter(torch.zeros(dim))  # b_t
-
-    def forward(self, class_embeds):
-        # class_embeds: [C, D]
-        adapted = class_embeds + self.drift  # broadcast over classes
-        adapted = F.normalize(adapted, dim=-1)
-        return adapted
 
 def create_zeroshot_model(args, train_dataset=None, overwrite=False):
     """
@@ -335,3 +326,170 @@ def train_drift(args, rigid_movement= False):
 
     if args.save is not None:
         return trained_head_path
+
+
+def train_1_layer_mlp(args):
+    train_dataset = args.train_dataset
+    ckpdir = os.path.join(args.save, train_dataset)
+    trained_adapter_path = os.path.join(ckpdir, "trained_1_layer_mlp_adapter.pt")
+
+    assert train_dataset is not None, "Please provide a training dataset."
+    if args.load is not None and args.load.endswith('pt'):
+        print("Loading image encoder.")
+        image_encoder = ImageEncoder.load(args.load)
+    else:
+        print('Building image encoder.')
+        image_encoder = ImageEncoder(args, keep_lang=False)
+
+    classification_head = get_classification_head(args, train_dataset, drift=False)
+    embedding_dim = classification_head.weight.shape[1]
+    print(f"Embedding dimension: {embedding_dim}")
+    adapter = TaskAdapter(dim=embedding_dim, normalize_output=True)
+
+    model = AdapterImageClassifier(image_encoder, adapter, classification_head)
+    model.freeze_base()
+    
+
+    preprocess_fn = model.train_preprocess
+    print_every = 100
+
+    dataset = get_dataset(
+        train_dataset,
+        preprocess_fn,
+        location=args.data_location,
+        batch_size=args.batch_size
+    )
+    num_batches = len(dataset.train_loader)
+
+    devices = list(range(torch.cuda.device_count()))
+    print('Using devices', devices)
+    model = torch.nn.DataParallel(model, device_ids=devices)
+    
+    if args.ls > 0:
+        loss_fn = LabelSmoothing(args.ls)
+    else:
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+
+    scheduler = cosine_lr(optimizer, args.lr, args.warmup_length, args.epochs * num_batches)
+
+    if args.save is not None:
+        os.makedirs(ckpdir, exist_ok=True)
+        create_zeroshot_model(args, train_dataset=train_dataset)
+
+    prev_val_acc = None
+    best_val_acc = -1.0
+    best_epoch = -1
+    best_train_loss = None
+    best_val_loss = None
+
+    for epoch in range(args.epochs):
+        model = model.cuda()
+        model.train()
+        model.module.image_encoder.eval()
+        model.module.classification_head.eval()
+        data_loader = get_dataloader(
+            dataset, is_train=True, args=args, image_encoder=None)
+
+        train_loss_sum = 0.0
+        train_batches = 0
+        for i, batch in enumerate(data_loader):
+            start_time = time.time()
+            
+            step = i + epoch * num_batches
+            scheduler(step)
+            optimizer.zero_grad()
+
+            batch = maybe_dictionarize(batch)
+            inputs = batch['images'].to('cuda:0')
+            labels = batch['labels'].to('cuda:0')
+            data_time = time.time() - start_time
+
+            logits = model(inputs)
+
+            loss = loss_fn(logits, labels)
+            train_loss_sum += loss.item()
+            train_batches += 1
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+
+            optimizer.step()
+            batch_time = time.time() - start_time
+
+            if step % print_every == 0:
+                percent_complete = 100 * i / len(data_loader)
+                print(
+                    f"Train Epoch: {epoch} [{percent_complete:.0f}% {i}/{len(dataset.train_loader)}]\t"
+                    f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}", flush=True
+                )
+
+        train_loss_epoch = train_loss_sum / train_batches if train_batches > 0 else 0.0
+
+        model.eval()
+        val_loader = get_dataloader(dataset, is_train=False, args=args, image_encoder=None)
+
+        val_correct = 0
+        val_total = 0
+        val_loss_sum = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = maybe_dictionarize(batch)
+                inputs = batch['images'].to('cuda:0')
+                labels = batch['labels'].to('cuda:0')
+
+                logits = model(inputs)
+                val_loss = loss_fn(logits, labels)
+                preds = logits.argmax(dim=1)
+
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+                val_loss_sum += val_loss.item()
+                val_batches += 1
+
+        val_acc = val_correct / val_total if val_total > 0 else 0.0
+        val_loss_epoch = val_loss_sum / val_batches if val_batches > 0 else 0.0
+
+        print(f"Validation summary for epoch {epoch}:")
+        print(f"Current validation accuracy: {100.0 * val_acc:.2f}%")
+        print(f"Current validation loss: {val_loss_epoch:.6f}")
+        print(f"Average training loss this epoch: {train_loss_epoch:.6f}")
+
+        if prev_val_acc is None:
+            print("Previous validation accuracy: N/A (first epoch)")
+        else:
+            print(f"Previous validation accuracy: {100.0 * prev_val_acc:.2f}%")
+            if val_acc > prev_val_acc:
+                print("Validation accuracy is going up compared to previous epoch.")
+            elif val_acc < prev_val_acc:
+                print("Validation accuracy went down compared to previous epoch.")
+            else:
+                print("Validation accuracy stayed the same as previous epoch.")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch
+            best_train_loss = train_loss_epoch
+            best_val_loss = val_loss_epoch
+            if args.save is not None:
+                model.module.adapter.save(trained_adapter_path)
+                print(f"Saved new best checkpoint to {trained_adapter_path}")
+            print(f"Best validation accuracy so far: {100.0 * best_val_acc:.2f}% (new best)")
+        else:
+            print(f"Best validation accuracy so far: {100.0 * best_val_acc:.2f}%")
+
+        prev_val_acc = val_acc
+
+    if best_epoch >= 0:
+        print("Best checkpoint summary:")
+        print(f"Best epoch: {best_epoch}")
+        print(f"Best validation accuracy: {100.0 * best_val_acc:.2f}%")
+        print(f"Training loss at best epoch: {best_train_loss:.6f}")
+        print(f"Validation loss at best epoch: {best_val_loss:.6f}")
+
+    if args.save is not None:
+        return trained_adapter_path
