@@ -48,30 +48,103 @@ def create_zeroshot_model(args, train_dataset=None, overwrite=False):
     image_encoder.save(zs_path)
     return zs_path
 
-def finetune(args):
+def _load_prompt_head_as_classification_head(args, train_dataset):
+    ckpdir = os.path.join(args.save, train_dataset)
+    base_dataset = train_dataset[:-3] if train_dataset.endswith("Val") else train_dataset
+    prompt_path = os.path.join(ckpdir, f"prompt_csc_{base_dataset}.pt")
+    if not os.path.isfile(prompt_path):
+        raise FileNotFoundError(f"Missing prompt head checkpoint for {train_dataset}: {prompt_path}")
+
+    prompt_obj = torch.load(prompt_path, map_location="cpu")
+    classification_head = get_classification_head(args, train_dataset, drift=False)
+
+    if isinstance(prompt_obj, torch.Tensor):
+        prompt_weights = prompt_obj
+        prompt_bias = None
+    elif isinstance(prompt_obj, dict):
+        if "weight" not in prompt_obj:
+            raise ValueError(f'Unsupported prompt head format at "{prompt_path}": missing "weight".')
+        prompt_weights = prompt_obj["weight"]
+        prompt_bias = prompt_obj.get("bias")
+    else:
+        raise ValueError(f'Unsupported prompt head checkpoint type at "{prompt_path}": {type(prompt_obj)}')
+
+    if classification_head.weight.shape != prompt_weights.shape:
+        raise ValueError(
+            f"Prompt head weight shape mismatch for {train_dataset}: "
+            f"expected {tuple(classification_head.weight.shape)}, got {tuple(prompt_weights.shape)}"
+        )
+    classification_head.weight.data.copy_(prompt_weights.to(classification_head.weight.device))
+
+    if prompt_bias is not None and classification_head.bias is not None:
+        if classification_head.bias.shape != prompt_bias.shape:
+            raise ValueError(
+                f"Prompt head bias shape mismatch for {train_dataset}: "
+                f"expected {tuple(classification_head.bias.shape)}, got {tuple(prompt_bias.shape)}"
+            )
+        classification_head.bias.data.copy_(prompt_bias.to(classification_head.bias.device))
+
+    return classification_head
+
+
+def adapted_finetuning(args, head_type="adapter"):
     train_dataset = args.train_dataset
     ckpdir = os.path.join(args.save, train_dataset)
+    if head_type == "adapter":
+        ft_path = os.path.join(ckpdir, "adapted_finetuned.pt")
+    elif head_type == "normal":
+        # Keep legacy naming for normal-head visual encoder fine-tuning.
+        ft_path = os.path.join(ckpdir, "finetuned.pt")
+    else:
+        ft_path = os.path.join(ckpdir, f"adapted_finetuned_{head_type}.pt")
 
-    # Check if checkpoints already exist
-    zs_path = os.path.join(args.save, train_dataset, 'checkpoint_0.pt')  
-    ft_path = os.path.join(args.save, train_dataset, f'checkpoint_{args.epochs}.pt')
-    if os.path.exists(zs_path) and os.path.exists(ft_path):
-        print(f'Skipping fine-tuning because {ft_path} exists.')
-        return zs_path, ft_path
+    if os.path.exists(ft_path):
+        print(f"Skipping fine-tuning because {ft_path} exists.")
+        return ft_path
 
     assert train_dataset is not None, "Please provide a training dataset."
-    if args.load is not None and args.load.endswith('pt'):
-        print("Loading image encoder.")
-        image_encoder = ImageEncoder.load(args.load)
+    
+    print('Building image encoder.')
+    image_encoder = ImageEncoder(args, keep_lang=False)
+
+    if head_type == "adapter":
+        adapter_path = os.path.join(ckpdir, "trained_1_layer_mlp_adapter.pt")
+        if not os.path.isfile(adapter_path):
+            raise FileNotFoundError(
+                f"Missing adapter checkpoint for {train_dataset}: {adapter_path}"
+            )
+        classification_head = get_classification_head(args, train_dataset, drift=False)
+        adapter = TaskAdapter.load(adapter_path)
+        model = AdapterImageClassifier(image_encoder, adapter, classification_head)
+        for param in model.adapter.parameters():
+            param.requires_grad_(False)
+    elif head_type == "normal":
+        classification_head = get_classification_head(args, train_dataset, drift=False)
+        model = ImageClassifier(image_encoder, classification_head)
+    elif head_type == "drift_per_task":
+        drift_path = os.path.join(ckpdir, "trained_drift_head.pt")
+        if not os.path.isfile(drift_path):
+            raise FileNotFoundError(f"Missing drift head checkpoint for {train_dataset}: {drift_path}")
+        classification_head = torch.load(drift_path, map_location="cpu")
+        model = ImageClassifier(image_encoder, classification_head)
+    elif head_type == "drift_per_class":
+        drift_path = os.path.join(ckpdir, "trained_drift_head_per_class.pt")
+        if not os.path.isfile(drift_path):
+            raise FileNotFoundError(f"Missing drift head checkpoint for {train_dataset}: {drift_path}")
+        classification_head = torch.load(drift_path, map_location="cpu")
+        model = ImageClassifier(image_encoder, classification_head)
+    elif head_type == "prompt_head":
+        classification_head = _load_prompt_head_as_classification_head(args, train_dataset)
+        model = ImageClassifier(image_encoder, classification_head)
     else:
-        print('Building image encoder.')
-        image_encoder = ImageEncoder(args, keep_lang=False)
+        raise ValueError(f"Unsupported head_type: {head_type}")
 
-    classification_head = get_classification_head(args, train_dataset)
-
-    model = ImageClassifier(image_encoder, classification_head)
-
-    model.freeze_head()
+    # Freeze classification head, train only image encoder.
+    model.classification_head.weight.requires_grad_(False)
+    if model.classification_head.bias is not None:
+        model.classification_head.bias.requires_grad_(False)
+    for param in model.image_encoder.parameters():
+        param.requires_grad_(True)
 
     preprocess_fn = model.train_preprocess
     print_every = 100
@@ -95,19 +168,29 @@ def finetune(args):
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
-
     scheduler = cosine_lr(optimizer, args.lr, args.warmup_length, args.epochs * num_batches)
 
-    # Save the starting zero-shot checkpoint in the model folder.
     if args.save is not None:
-        create_zeroshot_model(args, train_dataset=train_dataset)
+        os.makedirs(ckpdir, exist_ok=True)
+
+    prev_val_acc = None
+    best_val_acc = -1.0
+    best_epoch = -1
+    best_train_loss = None
+    best_val_loss = None
 
     for epoch in range(args.epochs):
         model = model.cuda()
         model.train()
+        # Keep frozen modules in eval mode.
+        if hasattr(model.module, "adapter"):
+            model.module.adapter.eval()
+        model.module.classification_head.eval()
         data_loader = get_dataloader(
             dataset, is_train=True, args=args, image_encoder=None)
 
+        train_loss_sum = 0.0
+        train_batches = 0
         for i, batch in enumerate(data_loader):
             start_time = time.time()
             
@@ -121,13 +204,12 @@ def finetune(args):
             data_time = time.time() - start_time
 
             logits = model(inputs)
-
             loss = loss_fn(logits, labels)
-
+            train_loss_sum += loss.item()
+            train_batches += 1
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(params, 1.0)
-
             optimizer.step()
             batch_time = time.time() - start_time
 
@@ -135,30 +217,100 @@ def finetune(args):
                 percent_complete = 100 * i / len(data_loader)
                 print(
                     f"Train Epoch: {epoch} [{percent_complete:.0f}% {i}/{len(dataset.train_loader)}]\t"
-                    f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}", flush=True
+                    f"Loss: {loss.item():.6f}\tData (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}",
+                    flush=True,
                 )
 
-    # Evaluate
+        train_loss_epoch = train_loss_sum / train_batches if train_batches > 0 else 0.0
+
+        model.eval()
+        val_loader = get_dataloader(dataset, is_train=False, args=args, image_encoder=None)
+
+        val_correct = 0
+        val_total = 0
+        val_loss_sum = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = maybe_dictionarize(batch)
+                inputs = batch['images'].to('cuda:0')
+                labels = batch['labels'].to('cuda:0')
+
+                logits = model(inputs)
+                val_loss = loss_fn(logits, labels)
+                preds = logits.argmax(dim=1)
+
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+                val_loss_sum += val_loss.item()
+                val_batches += 1
+
+        val_acc = val_correct / val_total if val_total > 0 else 0.0
+        val_loss_epoch = val_loss_sum / val_batches if val_batches > 0 else 0.0
+
+        print(f"Validation summary for epoch {epoch}:")
+        print(f"Current validation accuracy: {100.0 * val_acc:.2f}%")
+        print(f"Current validation loss: {val_loss_epoch:.6f}")
+        print(f"Average training loss this epoch: {train_loss_epoch:.6f}")
+
+        if prev_val_acc is None:
+            print("Previous validation accuracy: N/A (first epoch)")
+        else:
+            print(f"Previous validation accuracy: {100.0 * prev_val_acc:.2f}%")
+            if val_acc > prev_val_acc:
+                print("Validation accuracy is going up compared to previous epoch.")
+            elif val_acc < prev_val_acc:
+                print("Validation accuracy went down compared to previous epoch.")
+            else:
+                print("Validation accuracy stayed the same as previous epoch.")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch
+            best_train_loss = train_loss_epoch
+            best_val_loss = val_loss_epoch
+            if args.save is not None:
+                model.module.image_encoder.save(ft_path)
+                print(f"Saved new best checkpoint to {ft_path}")
+            print(f"Best validation accuracy so far: {100.0 * best_val_acc:.2f}% (new best)")
+        else:
+            print(f"Best validation accuracy so far: {100.0 * best_val_acc:.2f}%")
+
+        prev_val_acc = val_acc
+
+    if best_epoch >= 0:
+        print("Best checkpoint summary:")
+        print(f"Best epoch: {best_epoch}")
+        print(f"Best validation accuracy: {100.0 * best_val_acc:.2f}%")
+        print(f"Training loss at best epoch: {best_train_loss:.6f}")
+        print(f"Validation loss at best epoch: {best_val_loss:.6f}")
+
     image_encoder = model.module.image_encoder
     evaluate(image_encoder, args)
 
     if args.save is not None:
-        zs_path = os.path.join(ckpdir, 'zeroshot.pt')  
-        ft_path = os.path.join(ckpdir, 'finetuned.pt')
-        image_encoder.save(ft_path)
-        return zs_path, ft_path
+        return ft_path
+
+
+def finetune(args):
+    """Backward-compatible alias for adapted_finetuning."""
+    return adapted_finetuning(args)
 
 
 from src.modeling import ClassificationHead, ImageClassifier
 
-def train_drift(args, rigid_movement= False):
+
+def train_drift(args, drift_mode="per_task"):
     train_dataset = args.train_dataset
     ckpdir = os.path.join(args.save, train_dataset)
-    if rigid_movement is not False:
-        print("Training with rigid movement (no drift).")
-        trained_head_path = os.path.join(ckpdir, 'trained_rigid_drift_head.pt')
+    if drift_mode == "per_task":
+        trained_head_path = os.path.join(ckpdir, "trained_drift_head.pt")
+    elif drift_mode == "per_class":
+        trained_head_path = os.path.join(ckpdir, "trained_drift_head_per_class.pt")
     else:
-        trained_head_path = os.path.join(ckpdir, 'trained_drift_head.pt')
+        raise ValueError(f"Unsupported drift_mode: {drift_mode}")
+
+    print(f"Training drift head with mode: {drift_mode}")
 
     # The zero-drift initialization head is managed by get_classification_head().
     # train_drift() saves only the learned drift head to a separate checkpoint.
@@ -174,15 +326,10 @@ def train_drift(args, rigid_movement= False):
         print('Building image encoder.')
         image_encoder = ImageEncoder(args, keep_lang=False)
 
-    if rigid_movement is not False:
-        classification_head = get_classification_head(args, train_dataset, drift=False)
-    else:
-        classification_head = get_classification_head(args, train_dataset, drift=True)
+    classification_head = get_classification_head(args, train_dataset, drift=drift_mode)
 
     model = ImageClassifier(image_encoder, classification_head)
-
-    if rigid_movement is False:
-        model.freeze_head()
+    model.freeze_head()
     
     model.freeze_encoder()
 
@@ -207,9 +354,12 @@ def train_drift(args, rigid_movement= False):
         loss_fn = torch.nn.CrossEntropyLoss()
 
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    # Drift uses very few trainable parameters; strong weight decay can pin updates near zero.
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
 
-    scheduler = cosine_lr(optimizer, args.lr, args.warmup_length, args.epochs * num_batches)
+    total_steps = args.epochs * num_batches
+    warmup_steps = min(args.warmup_length, max(10, total_steps // 10))
+    scheduler = cosine_lr(optimizer, args.lr, warmup_steps, total_steps)
 
     if args.save is not None:
         os.makedirs(ckpdir, exist_ok=True)
@@ -371,7 +521,8 @@ def train_1_layer_mlp(args):
         loss_fn = torch.nn.CrossEntropyLoss()
 
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+    # For small adapters, default wd=0.1 is typically too aggressive.
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
 
     scheduler = cosine_lr(optimizer, args.lr, args.warmup_length, args.epochs * num_batches)
 

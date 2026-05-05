@@ -1,4 +1,4 @@
-from src.finetune import finetune
+from src.finetune import adapted_finetuning
 from src.args import parse_arguments
 from src.eval import evaluate
 data_location = "/data/139-1/datasets/merging"
@@ -36,4 +36,4 @@ for model in models:
         args.model = model
         args.save = f'/data/139-1/users/selkarrat/checkpoints/{model}'
         args.load = f'/data/139-1/users/selkarrat/checkpoints/{model}'
-        finetune(args)
+        adapted_finetuning(args)

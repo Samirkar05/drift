@@ -17,7 +17,11 @@ def _load_trained_head(head_path):
 def _effective_class_embeddings(head):
     class_embeds = head.weight.detach().cpu()
     if hasattr(head, "drift"):
-        class_embeds = class_embeds + head.drift.detach().cpu().unsqueeze(0)
+        drift = head.drift.detach().cpu()
+        if drift.ndim == 1:
+            class_embeds = class_embeds + drift.unsqueeze(0)
+        else:
+            class_embeds = class_embeds + drift
     return class_embeds
 
 

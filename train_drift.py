@@ -9,9 +9,9 @@ def parse_drift_runner_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--head-type",
-        choices=["drift", "rigid"],
-        default="drift",
-        help="Training mode: drift -> train_drift(..., rigid_movement=False), rigid -> rigid_movement=True.",
+        choices=["per_task", "per_class"],
+        default="per_task",
+        help="Drift mode: per_task -> one shared drift vector, per_class -> one drift vector per class.",
     )
     parser.add_argument(
         "--remove-previous-checkpoints",
@@ -56,15 +56,13 @@ for model in models:
 
         train_dataset = args.train_dataset
         ckpdir = os.path.join(args.save, train_dataset)
-        if runner_args.head_type == "rigid":
-            target_ckpt = os.path.join(ckpdir, "trained_rigid_drift_head.pt")
-            rigid_movement = True
+        if runner_args.head_type == "per_class":
+            target_ckpt = os.path.join(ckpdir, "trained_drift_head_per_class.pt")
         else:
             target_ckpt = os.path.join(ckpdir, "trained_drift_head.pt")
-            rigid_movement = False
 
         if runner_args.remove_previous_checkpoints and os.path.isfile(target_ckpt):
             os.remove(target_ckpt)
             print(f"Removed previous checkpoint: {target_ckpt}")
 
-        train_drift(args, rigid_movement=rigid_movement)
+        train_drift(args, drift_mode=runner_args.head_type)

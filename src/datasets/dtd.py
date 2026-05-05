@@ -11,7 +11,7 @@ class DTD:
                  num_workers=16):
         # Data loading code
         traindir = os.path.join(location, 'dtd', 'train')
-        valdir = os.path.join(location, 'dtd', 'val')
+        valdir = os.path.join(location, 'dtd', 'test')
 
         self.train_dataset = datasets.ImageFolder(
             traindir, transform=preprocess)

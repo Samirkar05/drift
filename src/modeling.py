@@ -94,13 +94,15 @@ class AdapterImageClassifier(torch.nn.Module):
             features = features / features.norm(dim=-1, keepdim=True)
 
         adapted_text_embeds = self.adapter(self.classification_head.weight)
-        return F.linear(features, adapted_text_embeds, self.classification_head.bias)
+        logits = F.linear(features, adapted_text_embeds, self.classification_head.bias)
+        logit_scale = getattr(self.classification_head, "logit_scale", 1.0)
+        return logits * logit_scale
 
     def __call__(self, inputs):
         return self.forward(inputs)
 
 class DriftClassificationHead(nn.Linear):
-    def __init__(self, normalize, weights, biases=None):
+    def __init__(self, normalize, weights, biases=None, logit_scale=1.0):
         output_size, input_size = weights.shape
         super().__init__(input_size, output_size, bias=True)
 
@@ -114,6 +116,9 @@ class DriftClassificationHead(nn.Linear):
             self.bias = nn.Parameter(torch.zeros(output_size), requires_grad=False)
 
         self.drift = nn.Parameter(torch.zeros(input_size), requires_grad=True) # [D]
+        if torch.is_tensor(logit_scale):
+            logit_scale = float(logit_scale.detach().cpu().item())
+        self.logit_scale = float(logit_scale)
 
     def forward(self, inputs):
         if self.normalize:
@@ -122,7 +127,8 @@ class DriftClassificationHead(nn.Linear):
         effective_weight = self.weight + self.drift.unsqueeze(0)   # [C, D]
         effective_weight = F.normalize(effective_weight, dim=-1)
 
-        return F.linear(inputs, effective_weight, self.bias)
+        logits = F.linear(inputs, effective_weight, self.bias)
+        return logits * getattr(self, "logit_scale", 1.0)
     def __call__(self, inputs):
         return self.forward(inputs)
     
@@ -135,11 +141,57 @@ class DriftClassificationHead(nn.Linear):
         print(f'Loading classification head from {filename}')
         return utils.torch_load(filename)
 
+
+class PerClassDriftClassificationHead(nn.Linear):
+    def __init__(self, normalize, weights, biases=None, logit_scale=1.0):
+        output_size, input_size = weights.shape
+        super().__init__(input_size, output_size, bias=True)
+
+        self.normalize = normalize
+
+        self.weight = nn.Parameter(weights.clone(), requires_grad=False)
+
+        if biases is not None:
+            self.bias = nn.Parameter(biases.clone(), requires_grad=False)
+        else:
+            self.bias = nn.Parameter(torch.zeros(output_size), requires_grad=False)
+
+        # One learnable drift vector per class: [C, D].
+        self.drift = nn.Parameter(torch.zeros_like(weights), requires_grad=True)
+        if torch.is_tensor(logit_scale):
+            logit_scale = float(logit_scale.detach().cpu().item())
+        self.logit_scale = float(logit_scale)
+
+    def forward(self, inputs):
+        if self.normalize:
+            inputs = inputs / inputs.norm(dim=-1, keepdim=True)
+
+        effective_weight = self.weight + self.drift
+        effective_weight = F.normalize(effective_weight, dim=-1)
+
+        logits = F.linear(inputs, effective_weight, self.bias)
+        return logits * getattr(self, "logit_scale", 1.0)
+
+    def __call__(self, inputs):
+        return self.forward(inputs)
+
+    def save(self, filename):
+        print(f'Saving classification head to {filename}')
+        utils.torch_save(self, filename)
+
+    @classmethod
+    def load(cls, filename):
+        print(f'Loading classification head from {filename}')
+        return utils.torch_load(filename)
+
 class ClassificationHead(torch.nn.Linear):
-    def __init__(self, normalize, weights, biases=None):
+    def __init__(self, normalize, weights, biases=None, logit_scale=1.0):
         output_size, input_size = weights.shape
         super().__init__(input_size, output_size)
         self.normalize = normalize
+        if torch.is_tensor(logit_scale):
+            logit_scale = float(logit_scale.detach().cpu().item())
+        self.logit_scale = float(logit_scale)
         if weights is not None:
             self.weight = torch.nn.Parameter(weights.clone())
         if biases is not None:
@@ -150,7 +202,8 @@ class ClassificationHead(torch.nn.Linear):
     def forward(self, inputs):
         if self.normalize:
             inputs = inputs / inputs.norm(dim=-1, keepdim=True)
-        return super().forward(inputs)
+        logits = super().forward(inputs)
+        return logits * getattr(self, "logit_scale", 1.0)
 
     def __call__(self, inputs):
         return self.forward(inputs)

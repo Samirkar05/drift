@@ -14,8 +14,9 @@ class TaskVector():
         else:
             assert pretrained_checkpoint is not None and finetuned_checkpoint is not None
             with torch.no_grad():
-                pretrained_state_dict = torch.load(pretrained_checkpoint, map_location="cuda:0").state_dict() # I FORCED TO LOAD INTO GPU 0
-                finetuned_state_dict = torch.load(finetuned_checkpoint, map_location="cuda:0").state_dict()  # I FORCED TO LOAD INTO GPU 0
+                map_location = "cuda:0" if torch.cuda.is_available() else "cpu"
+                pretrained_state_dict = torch.load(pretrained_checkpoint, map_location=map_location).state_dict()
+                finetuned_state_dict = torch.load(finetuned_checkpoint, map_location=map_location).state_dict()
                 self.vector = {}
                 for key in pretrained_state_dict:
                     if pretrained_state_dict[key].dtype in [torch.int64, torch.uint8]:
@@ -49,7 +50,8 @@ class TaskVector():
     def apply_to(self, pretrained_checkpoint, scaling_coef=1.0):
         """Apply a task vector to a pretrained model."""
         with torch.no_grad():
-            pretrained_model = torch.load(pretrained_checkpoint)
+            map_location = "cuda:0" if torch.cuda.is_available() else "cpu"
+            pretrained_model = torch.load(pretrained_checkpoint, map_location=map_location)
             new_state_dict = {}
             pretrained_state_dict = pretrained_model.state_dict()
             for key in pretrained_state_dict:
@@ -67,4 +69,3 @@ class TaskVector():
                 new_state_dict[key] = base_tensor + scaling_coef * vector_tensor
         pretrained_model.load_state_dict(new_state_dict, strict=False)
         return pretrained_model
-
